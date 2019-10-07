@@ -86,12 +86,12 @@ exc = getattr(builtins, "IOError", "FileNotFoundError")
 
 ### define dlrm in PyTorch ###
 class DLRM_Net(nn.Module):
-    def create_mlp(self, ln, sigmoid_layer):
+    def create_mlp(self, layer_size_list, sigmoid_layer):
         # build MLP layer by layer
         layers = nn.ModuleList()
-        for i in range(0, ln.size - 1):
-            cur_layer_size = ln[i]
-            next_layer_size = ln[i + 1]
+        for i in range(0, layer_size_list.size - 1):
+            cur_layer_size = layer_size_list[i]
+            next_layer_size = layer_size_list[i + 1]
 
             # construct fully connected operator
             LL = nn.Linear(in_features=int(cur_layer_size),
@@ -156,12 +156,12 @@ class DLRM_Net(nn.Module):
         self,
         embeding_dim=None, # 2
         embedding_vocab_sizes=None, # ndarray([4,3,2])
-        ln_bot=None, # ndarray([4,3,2])
-        ln_top=None, # [8,4,2,1]
+        bottom_layer_size_list=None, # ndarray([4,3,2])
+        top_layer_size_list=None, # [8,4,2,1]
         arch_interaction_op=None, # dot
         arch_interaction_itself=False,
-        sigmoid_bot=-1,
-        sigmoid_top=-1,
+        sigmoid_bottom_index=-1,
+        sigmoid_top_index=-1,
         sync_dense_params=True,
         loss_threshold=0.0,
         ndevices=-1,
@@ -171,8 +171,8 @@ class DLRM_Net(nn.Module):
         if (
             (embeding_dim is not None)
             and (embedding_vocab_sizes is not None)
-            and (ln_bot is not None)
-            and (ln_top is not None)
+            and (bottom_layer_size_list is not None)
+            and (top_layer_size_list is not None)
             and (arch_interaction_op is not None)
         ):
 
@@ -187,8 +187,8 @@ class DLRM_Net(nn.Module):
             self.loss_threshold = loss_threshold
             # create operators
             self.embedding_layers = self.create_emb(embeding_dim, embedding_vocab_sizes) # m_spa:2, ln_emb:[4,3,2],此处有3个embedding
-            self.bottom_mlp_layers = self.create_mlp(ln_bot, sigmoid_bot)
-            self.top_mlp_layers = self.create_mlp(ln_top, sigmoid_top)
+            self.bottom_mlp_layers = self.create_mlp(bottom_layer_size_list, sigmoid_bottom_index)
+            self.top_mlp_layers = self.create_mlp(top_layer_size_list, sigmoid_top_index)
 
     def apply_mlp(self, x, layers):
         # approach 1: use ModuleList
@@ -481,8 +481,8 @@ if __name__ == "__main__":
         print("Using CPU...")
 
     ### prepare training data ###
-    ln_bot = np.fromstring(args.arch_mlp_bot, dtype=int, sep="-") # ln_bot:array([4,3,2]), 代表mlp网络:4 ->3 ->2
-    print("ln_bot:{}".format(ln_bot))
+    bottom_layer_size_list = np.fromstring(args.arch_mlp_bot, dtype=int, sep="-") # ln_bot:array([4,3,2]), 代表mlp网络:4 ->3 ->2
+    print("ln_bot:{}".format(bottom_layer_size_list))
     # input data
     if args.data_generation == "dataset":
         # input and target from dataset
@@ -540,9 +540,9 @@ if __name__ == "__main__":
         )
         nbatches_test = len(test_loader)
 
-        ln_emb = train_data.counts
+        embed_vocab_size_list = train_data.counts
         m_den = train_data.m_den
-        ln_bot[0] = m_den
+        bottom_layer_size_list[0] = m_den
     else:
         # input and target at random
         def collate_wrapper(list_of_tuples):
@@ -556,11 +556,11 @@ if __name__ == "__main__":
             else:
                 return list_of_tuples[0]
 
-        ln_emb = np.fromstring(args.arch_embedding_size, dtype=int, sep="-") # ln_emb:array([4,3,2])
-        m_den = ln_bot[0] # bot => bottom, m_den:4
+        embed_vocab_size_list = np.fromstring(args.arch_embedding_size, dtype=int, sep="-") # ln_emb:array([4,3,2])
+        m_den = bottom_layer_size_list[0] # bot => bottom, m_den:4
         train_data = dp.RandomDataset(
             m_den, # 4
-            ln_emb, # [4,3,2]
+            embed_vocab_size_list, # [4,3,2]
             args.data_size, # 100
             args.num_batches, # 0
             args.mini_batch_size, # 10
@@ -587,10 +587,10 @@ if __name__ == "__main__":
         nbatches = args.num_batches if args.num_batches > 0 else len(train_loader)
 
     ### parse command line arguments ###
-    m_spa = args.arch_sparse_feature_size # 2
-    num_fea = ln_emb.size + 1  # num sparse + num dense features, category类特征的个数+1
+    embed_dim = args.arch_sparse_feature_size # 2
+    num_fea = embed_vocab_size_list.size + 1  # num sparse + num dense features, category类特征的个数+1
     #m_den_out = ln_bot[ln_bot.size - 1]
-    m_den_out = ln_bot[-1] # dense网络的最终输出
+    m_den_out = bottom_layer_size_list[-1] # dense网络的最终输出
     if args.arch_interaction_op == "dot":
         # approach 1: all
         # num_int = num_fea * num_fea + m_den_out
@@ -608,28 +608,28 @@ if __name__ == "__main__":
             + " is not supported"
         )
     arch_mlp_top_adjusted = str(num_int) + "-" + args.arch_mlp_top  #  8-4-2-1
-    ln_top = np.fromstring(arch_mlp_top_adjusted, dtype=int, sep="-") # [8,4,2,1]
+    top_layer_size_list = np.fromstring(arch_mlp_top_adjusted, dtype=int, sep="-") # [8,4,2,1]
     # sanity check: feature sizes and mlp dimensions must match
-    if m_den != ln_bot[0]:
+    if m_den != bottom_layer_size_list[0]:
         sys.exit(
             "ERROR: arch-dense-feature-size "
             + str(m_den)
             + " does not match first dim of bottom mlp "
-            + str(ln_bot[0])
+            + str(bottom_layer_size_list[0])
         )
-    if m_spa != m_den_out:
+    if embed_dim != m_den_out:
         sys.exit(
             "ERROR: arch-sparse-feature-size "
-            + str(m_spa)
+            + str(embed_dim)
             + " does not match last dim of bottom mlp "
             + str(m_den_out)
         )
-    if num_int != ln_top[0]:
+    if num_int != top_layer_size_list[0]:
         sys.exit(
             "ERROR: # of feature interactions "
             + str(num_int)
             + " does not match first dimension of top mlp "
-            + str(ln_top[0])
+            + str(top_layer_size_list[0])
         )
 
     # test prints (model arch)
@@ -637,32 +637,32 @@ if __name__ == "__main__":
         print("model arch:")
         print(
             "mlp top arch "
-            + str(ln_top.size - 1)
+            + str(top_layer_size_list.size - 1)
             + " layers, with input to output dimensions:"
         )
-        print(ln_top)
+        print(top_layer_size_list)
         print("# of interactions")
         print(num_int)
         print(
             "mlp bot arch "
-            + str(ln_bot.size - 1)
+            + str(bottom_layer_size_list.size - 1)
             + " layers, with input to output dimensions:"
         )
-        print(ln_bot)
+        print(bottom_layer_size_list)
         print("# of features (sparse and dense)")
         print(num_fea)
         print("dense feature size")
         print(m_den)
         print("sparse feature size")
-        print(m_spa)
+        print(embed_dim)
         print(
             "# of embeddings (= # of sparse features) "
-            + str(ln_emb.size)
+            + str(embed_vocab_size_list.size)
             + ", with dimensions "
-            + str(m_spa)
+            + str(embed_dim)
             + "x:"
         )
-        print(ln_emb)
+        print(embed_vocab_size_list)
 
         print("data (inputs and targets):")
         for j, (dense_X, sparse_offset, sparse_index, Y) in enumerate(train_loader):
@@ -689,14 +689,14 @@ if __name__ == "__main__":
     # the weights we need to start from the same random seed.
     # np.random.seed(args.numpy_rand_seed)
     dlrm = DLRM_Net(
-        m_spa,
-        ln_emb,
-        ln_bot,
-        ln_top,
+        embed_dim,
+        embed_vocab_size_list,
+        bottom_layer_size_list,
+        top_layer_size_list,
         arch_interaction_op=args.arch_interaction_op,
         arch_interaction_itself=args.arch_interaction_itself,
-        sigmoid_bot=-1,
-        sigmoid_top=ln_top.size - 2,
+        sigmoid_bottom_index=-1,
+        sigmoid_top_index=top_layer_size_list.size - 2,
         sync_dense_params=args.sync_dense_params,
         loss_threshold=args.loss_threshold,
     )
@@ -743,11 +743,11 @@ if __name__ == "__main__":
         else:
             return dlrm(dense_x, sparse_offset, sparse_index)
 
-    def loss_fn_wrap(Z, Y, use_gpu, device):
+    def loss_fn_wrap(Y_pred, Y, use_gpu, device):
         if use_gpu:
-            return loss_fn(Z, Y.to(device))
+            return loss_fn(Y_pred, Y.to(device))
         else:
-            return loss_fn(Z, Y)
+            return loss_fn(Y_pred, Y)
 
     # training or inference
     best_gA_test = 0

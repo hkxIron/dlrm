@@ -133,7 +133,10 @@ class CriteoDataset(Dataset):
 # uniform ditribution (input data)
 class RandomDataset(Dataset):
 
-    def __init__(self, m_den, ln_emb, data_size, num_batches, mini_batch_size, num_indices_per_lookup, num_indices_per_lookup_fixed, num_targets=1, round_targets=False, data_generation="random", trace_file="", enable_padding=False, reset_seed_on_access=False, rand_seed=0):
+    def __init__(self, m_den, ln_emb, data_size, num_batches, mini_batch_size,
+                 num_indices_per_lookup, num_indices_per_lookup_fixed, num_targets=1,
+                 round_targets=False, data_generation="random", trace_file="", enable_padding=False,
+                 reset_seed_on_access=False, rand_seed=0):
         # compute batch size
         nbatches = int(np.ceil((data_size * 1.0) / mini_batch_size))
         if num_batches != 0:

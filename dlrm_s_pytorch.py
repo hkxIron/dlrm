@@ -90,22 +90,24 @@ class DLRM_Net(nn.Module):
         # build MLP layer by layer
         layers = nn.ModuleList()
         for i in range(0, ln.size - 1):
-            n = ln[i]
-            m = ln[i + 1]
+            cur_layer_size = ln[i]
+            next_layer_size = ln[i + 1]
 
             # construct fully connected operator
-            LL = nn.Linear(int(n), int(m), bias=True)
+            LL = nn.Linear(in_features=int(cur_layer_size),
+                           out_features=int(next_layer_size),
+                           bias=True)
 
             # initialize the weights
             # with torch.no_grad():
             # custom Xavier input, output or two-sided fill
             mean = 0.0  # std_dev = np.sqrt(variance)
-            std_dev = np.sqrt(2 / (m + n))  # np.sqrt(1 / m) # np.sqrt(1 / n)
-            W = np.random.normal(mean, std_dev, size=(m, n)).astype(np.float32)
-            std_dev = np.sqrt(1 / m)  # np.sqrt(2 / (m + 1))
-            bt = np.random.normal(mean, std_dev, size=m).astype(np.float32)
+            std_dev = np.sqrt(2 / (next_layer_size + cur_layer_size))  # np.sqrt(1 / next_layer_size) # np.sqrt(1 / cur_layer_size)
+            W = np.random.normal(mean, std_dev, size=(next_layer_size, cur_layer_size)).astype(np.float32)
+            std_dev = np.sqrt(1 / next_layer_size)  # np.sqrt(2 / (next_layer_size + 1))
+            bt = np.random.normal(mean, std_dev, size=next_layer_size).astype(np.float32)
             # approach 1
-            LL.weight.data = torch.tensor(W, requires_grad=True)
+            LL.weight.data = torch.tensor(W, requires_grad=True)  # pytorch中layer的weight可以单独拿出来
             LL.bias.data = torch.tensor(bt, requires_grad=True)
             # approach 2
             # LL.weight.data.copy_(torch.tensor(W))
@@ -126,35 +128,37 @@ class DLRM_Net(nn.Module):
         # approach 2: use Sequential container to wrap all layers
         return torch.nn.Sequential(*layers)
 
-    def create_emb(self, m, ln):
-        emb_l = nn.ModuleList()
-        for i in range(0, ln.size):
-            n = ln[i]
-
+    def create_emb(self, dim_size:int, vocab_size_list:np.ndarray): # m:2, ln:[2,3,4]
+        # ln:[2,3,4], m=2, 意思是分别创建三个embedding矩阵,它们的dim均为2
+        emb_module_list = nn.ModuleList()
+        for i in range(0, vocab_size_list.size):
+            vocab_size = vocab_size_list[i]  # vocab_size
             # construct embedding operator
-            EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True)
+            embedding_bag = nn.EmbeddingBag(vocab_size, dim_size, mode="sum", sparse=True) # n:vocab_size, m:emb_dim
             # initialize embeddings
-            # nn.init.uniform_(EE.weight, a=-np.sqrt(1 / n), b=np.sqrt(1 / n))
+            # nn.init.uniform_(embedding_bag.weight, a=-np.sqrt(1 / n), b=np.sqrt(1 / n))
             W = np.random.uniform(
-                low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, m)
+                low=-np.sqrt(1 / vocab_size),
+                high=np.sqrt(1 / vocab_size),
+                size=(vocab_size, dim_size)
             ).astype(np.float32)
-            # approach 1
-            EE.weight.data = torch.tensor(W, requires_grad=True)
+            # approach 1, embedding初始化
+            embedding_bag.weight.data = torch.tensor(W, requires_grad=True)
             # approach 2
-            # EE.weight.data.copy_(torch.tensor(W))
+            # embedding_bag.weight.data.copy_(torch.tensor(W))
             # approach 3
-            # EE.weight = Parameter(torch.tensor(W),requires_grad=True)
-            emb_l.append(EE)
+            # embedding_bag.weight = Parameter(torch.tensor(W),requires_grad=True)
+            emb_module_list.append(embedding_bag)
 
-        return emb_l
+        return emb_module_list
 
     def __init__(
         self,
-        m_spa=None,
-        ln_emb=None,
-        ln_bot=None,
-        ln_top=None,
-        arch_interaction_op=None,
+        embeding_dim=None, # 2
+        embedding_vocab_sizes=None, # ndarray([4,3,2])
+        ln_bot=None, # ndarray([4,3,2])
+        ln_top=None, # [8,4,2,1]
+        arch_interaction_op=None, # dot
         arch_interaction_itself=False,
         sigmoid_bot=-1,
         sigmoid_top=-1,
@@ -165,8 +169,8 @@ class DLRM_Net(nn.Module):
         super(DLRM_Net, self).__init__()
 
         if (
-            (m_spa is not None)
-            and (ln_emb is not None)
+            (embeding_dim is not None)
+            and (embedding_vocab_sizes is not None)
             and (ln_bot is not None)
             and (ln_top is not None)
             and (arch_interaction_op is not None)
@@ -182,9 +186,9 @@ class DLRM_Net(nn.Module):
             self.sync_dense_params = sync_dense_params
             self.loss_threshold = loss_threshold
             # create operators
-            self.emb_l = self.create_emb(m_spa, ln_emb)
-            self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
-            self.top_l = self.create_mlp(ln_top, sigmoid_top)
+            self.embedding_layers = self.create_emb(embeding_dim, embedding_vocab_sizes) # m_spa:2, ln_emb:[4,3,2],此处有3个embedding
+            self.bottom_mlp_layers = self.create_mlp(ln_bot, sigmoid_bot)
+            self.top_mlp_layers = self.create_mlp(ln_top, sigmoid_top)
 
     def apply_mlp(self, x, layers):
         # approach 1: use ModuleList
@@ -194,7 +198,7 @@ class DLRM_Net(nn.Module):
         # approach 2: use Sequential container to wrap all layers
         return layers(x)
 
-    def apply_emb(self, lS_o, lS_i, emb_l):
+    def apply_emb(self, sparse_offset, sparse_index, embedding_layers):
         # WARNING: notice that we are processing the batch at once. We implicitly
         # assume that the data is laid out such that:
         # 1. each embedding is indexed with a group of sparse indices,
@@ -202,47 +206,49 @@ class DLRM_Net(nn.Module):
         # 2. for each embedding the lookups are further organized into a batch
         # 3. for a list of embedding tables there is a list of batched lookups
 
-        ly = []
-        for k, sparse_index_group_batch in enumerate(lS_i):
-            sparse_offset_group_batch = lS_o[k]
+        layers = [] # K:为embedding的group下标,即这个embedding来源于何处
+        for k, sparse_index_group_batch in enumerate(sparse_index):
+            sparse_offset_group_batch = sparse_offset[k]
 
             # embedding lookup
             # We are using EmbeddingBag, which implicitly uses sum operator.
             # The embeddings are represented as tall matrices, with sum
             # happening vertically across 0 axis, resulting in a row vector
-            E = emb_l[k]
-            V = E(sparse_index_group_batch, sparse_offset_group_batch)
+            current_embed_layer = embedding_layers[k]
+            # 此处会调用EmbeddingBag.forward方法, vecotr:[batch, embedding_dim=2]
+            vector = current_embed_layer(input=sparse_index_group_batch, offsets=sparse_offset_group_batch)
 
-            ly.append(V)
+            layers.append(vector)
 
         # print(ly)
-        return ly
-
-    def interact_features(self, x, ly):
+        return layers
+    # dense_x:[batch, dim=2], category_embedding:3 list of [batch_dim]
+    def interact_features(self, dense_x, category_embedding):
         if self.arch_interaction_op == "dot":
             # concatenate dense and sparse features
-            (batch_size, d) = x.shape
-            T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
-            # perform a dot product
-            Z = torch.bmm(T, torch.transpose(T, 1, 2))
+            (batch_size, dim) = dense_x.shape
+            T = torch.cat([dense_x] + category_embedding, dim=1).view((batch_size, -1, dim)) # T: [batch, feat_group_num=4, dim]
+            # perform a dot product, 即两两特征进行交互
+            Z_interact = torch.bmm(T, torch.transpose(T, 1, 2)) # transpose(T, 1, 2), Z: [batch, feat_group_num, feat_group_num]
             # append dense feature with the interactions (into a row vector)
             # approach 1: all
             # Zflat = Z.view((batch_size, -1))
             # approach 2: unique
-            _, ni, nj = Z.shape
+            _, ni, nj = Z_interact.shape
             # approach 1: tril_indices
             # offset = 0 if self.arch_interaction_itself else -1
-            # li, lj = torch.tril_indices(ni, nj, offset=offset)
-            # approach 2: custom
+            # li, lj = torch.tril_indices(ni, nj, offset=offset) # 这种方法更好理解一些
+
+            # approach 2: custom, 任意两组的特征进行两两交互
             offset = 1 if self.arch_interaction_itself else 0
-            li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
-            lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
-            Zflat = Z[:, li, lj]
+            li = torch.tensor([i for i in range(ni) for j in range(i + offset)]) # li:[1,2,2,3,3,3]
+            lj = torch.tensor([j for i in range(nj) for j in range(i + offset)]) # lj:[0,0,1,0,1,2]
+            Zflat = Z_interact[:, li, lj] # Z_interact:[batch, feat_group_num, feat_group_num], Z_flat:[batch, comb(feat_group_num=4,2)=6]
             # concatenate dense features and interactions
-            R = torch.cat([x] + [Zflat], dim=1)
+            R = torch.cat([dense_x] + [Zflat], dim=1) # [batch, comb(feat_group_num,2)+dense_dim]
         elif self.arch_interaction_op == "cat":
             # concatenation features (into a row vector)
-            R = torch.cat([x] + ly, dim=1)
+            R = torch.cat([dense_x] + category_embedding, dim=1)
         else:
             sys.exit(
                 "ERROR: --arch-interaction-op="
@@ -252,30 +258,30 @@ class DLRM_Net(nn.Module):
 
         return R
 
-    def forward(self, dense_x, lS_o, lS_i):
+    def forward(self, dense_x, sparse_offset, sparse_index):
         if self.ndevices <= 1:
-            return self.sequential_forward(dense_x, lS_o, lS_i)
+            return self.sequential_forward(dense_x, sparse_offset, sparse_index)
         else:
-            return self.parallel_forward(dense_x, lS_o, lS_i)
+            return self.parallel_forward(dense_x, sparse_offset, sparse_index)
 
-    def sequential_forward(self, dense_x, lS_o, lS_i):
+    def sequential_forward(self, dense_x, sparse_offset, sparse_index):
         # process dense features (using bottom mlp), resulting in a row vector
-        x = self.apply_mlp(dense_x, self.bot_l)
+        dense_out = self.apply_mlp(dense_x, self.bottom_mlp_layers)
         # debug prints
         # print("intermediate")
         # print(x.detach().cpu().numpy())
 
         # process sparse features(using embeddings), resulting in a list of row vectors
-        ly = self.apply_emb(lS_o, lS_i, self.emb_l)
+        category_embedding_out = self.apply_emb(sparse_offset, sparse_index, self.embedding_layers)
         # for y in ly:
         #     print(y.detach().cpu().numpy())
 
-        # interact features (dense and sparse)
-        z = self.interact_features(x, ly)
+        # interact features (dense and sparse), z:[batch, 8]
+        z = self.interact_features(dense_out, category_embedding_out)
         # print(z.detach().cpu().numpy())
 
-        # obtain probability of a click (using top mlp)
-        p = self.apply_mlp(z, self.top_l)
+        # obtain probability of a click (using top mlp), 在交互项之后的layer
+        p = self.apply_mlp(z, self.top_mlp_layers) # layer:8->4->2->1
 
         # clamp output if needed
         if 0.0 < self.loss_threshold and self.loss_threshold < 1.0:
@@ -289,7 +295,7 @@ class DLRM_Net(nn.Module):
         ### prepare model (overwrite) ###
         # WARNING: # of devices must be >= batch size in parallel_forward call
         batch_size = dense_x.size()[0]
-        ndevices = min(self.ndevices, batch_size, len(self.emb_l))
+        ndevices = min(self.ndevices, batch_size, len(self.embedding_layers))
         device_ids = range(ndevices)
         # WARNING: must redistribute the model if mini-batch size changes(this is common
         # for last mini-batch, when # of elements in the dataset/batch size is not even
@@ -298,15 +304,15 @@ class DLRM_Net(nn.Module):
 
         if self.sync_dense_params or self.parallel_model_is_not_prepared:
             # replicate mlp (data parallelism)
-            self.bot_l_replicas = replicate(self.bot_l, device_ids)
-            self.top_l_replicas = replicate(self.top_l, device_ids)
+            self.bot_l_replicas = replicate(self.bottom_mlp_layers, device_ids)
+            self.top_l_replicas = replicate(self.top_mlp_layers, device_ids)
             # distribute embeddings (model parallelism)
             t_list = []
-            for k, emb in enumerate(self.emb_l):
+            for k, emb in enumerate(self.embedding_layers):
                 d = torch.device("cuda:" + str(k % ndevices))
                 emb.to(d)
                 t_list.append(emb.to(d))
-            self.emb_l = nn.ModuleList(t_list)
+            self.embedding_layers = nn.ModuleList(t_list)
             self.parallel_model_batch_size = batch_size
             self.parallel_model_is_not_prepared = False
 
@@ -315,12 +321,12 @@ class DLRM_Net(nn.Module):
         # print(dense_x.device)
         dense_x = scatter(dense_x, device_ids, dim=0)
         # distribute sparse features (model parallelism)
-        if (len(self.emb_l) != len(lS_o)) or (len(self.emb_l) != len(lS_i)):
+        if (len(self.embedding_layers) != len(lS_o)) or (len(self.embedding_layers) != len(lS_i)):
             sys.exit("ERROR: corrupted model input detected in parallel_forward call")
 
         t_list = []
         i_list = []
-        for k, _ in enumerate(self.emb_l):
+        for k, _ in enumerate(self.embedding_layers):
             d = torch.device("cuda:" + str(k % ndevices))
             t_list.append(lS_o[k].to(d))
             i_list.append(lS_i[k].to(d))
@@ -339,7 +345,7 @@ class DLRM_Net(nn.Module):
         # print(x)
 
         # embeddings
-        ly = self.apply_emb(lS_o, lS_i, self.emb_l)
+        ly = self.apply_emb(lS_o, lS_i, self.embedding_layers)
         # debug prints
         # print(ly)
 
@@ -349,11 +355,11 @@ class DLRM_Net(nn.Module):
         # corresponding to all embedding lookups, but part of the batch on each device.
         # Therefore, matching the distribution of output of bottom mlp, so that both
         # could be used for subsequent interactions on each device.
-        if len(self.emb_l) != len(ly):
+        if len(self.embedding_layers) != len(ly):
             sys.exit("ERROR: corrupted intermediate result in parallel_forward call")
 
         t_list = []
-        for k, _ in enumerate(self.emb_l):
+        for k, _ in enumerate(self.embedding_layers):
             d = torch.device("cuda:" + str(k % ndevices))
             y = scatter(ly[k], device_ids, dim=0)
             t_list.append(y)
@@ -418,7 +424,7 @@ if __name__ == "__main__":
     parser.add_argument("--loss-threshold", type=float, default=0.0)  # 1.0e-7
     parser.add_argument("--round-targets", type=bool, default=False)
     # data
-    parser.add_argument("--data-size", type=int, default=1)
+    parser.add_argument("--data-size", type=int, default=100)
     parser.add_argument("--num-batches", type=int, default=0)
     parser.add_argument(
         "--data-generation", type=str, default="random"
@@ -433,9 +439,9 @@ if __name__ == "__main__":
     parser.add_argument("--num-indices-per-lookup-fixed", type=bool, default=False)
     parser.add_argument("--num-workers", type=int, default=0)
     # training
-    parser.add_argument("--mini-batch-size", type=int, default=1)
-    parser.add_argument("--nepochs", type=int, default=1)
-    parser.add_argument("--learning-rate", type=float, default=0.01)
+    parser.add_argument("--mini-batch-size", type=int, default=10)
+    parser.add_argument("--nepochs", type=int, default=3)
+    parser.add_argument("--learning-rate", type=float, default=0.001)
     parser.add_argument("--print-precision", type=int, default=5)
     parser.add_argument("--numpy-rand-seed", type=int, default=123)
     parser.add_argument("--sync-dense-params", type=bool, default=True)
@@ -475,7 +481,8 @@ if __name__ == "__main__":
         print("Using CPU...")
 
     ### prepare training data ###
-    ln_bot = np.fromstring(args.arch_mlp_bot, dtype=int, sep="-")
+    ln_bot = np.fromstring(args.arch_mlp_bot, dtype=int, sep="-") # ln_bot:array([4,3,2]), 代表mlp网络:4 ->3 ->2
+    print("ln_bot:{}".format(ln_bot))
     # input data
     if args.data_generation == "dataset":
         # input and target from dataset
@@ -484,7 +491,7 @@ if __name__ == "__main__":
             transposed_data = list(zip(*list_of_tuples))
             X_int = torch.stack(transposed_data[0], 0)
             X_cat = torch.stack(transposed_data[1], 0)
-            T     = torch.stack(transposed_data[2], 0).view(-1,1)
+            T     = torch.stack(transposed_data[2], 0).view(-1,1) # [batch, 1]
 
             sz0 = X_cat.shape[0]
             sz1 = X_cat.shape[1]
@@ -549,14 +556,14 @@ if __name__ == "__main__":
             else:
                 return list_of_tuples[0]
 
-        ln_emb = np.fromstring(args.arch_embedding_size, dtype=int, sep="-")
-        m_den = ln_bot[0]
+        ln_emb = np.fromstring(args.arch_embedding_size, dtype=int, sep="-") # ln_emb:array([4,3,2])
+        m_den = ln_bot[0] # bot => bottom, m_den:4
         train_data = dp.RandomDataset(
-            m_den,
-            ln_emb,
-            args.data_size,
-            args.num_batches,
-            args.mini_batch_size,
+            m_den, # 4
+            ln_emb, # [4,3,2]
+            args.data_size, # 100
+            args.num_batches, # 0
+            args.mini_batch_size, # 10
             args.num_indices_per_lookup,
             args.num_indices_per_lookup_fixed,
             1, # num_targets
@@ -567,6 +574,7 @@ if __name__ == "__main__":
             reset_seed_on_access=True,
             rand_seed=args.numpy_rand_seed
         ) #WARNING: generates a batch of lookups at once
+
         train_loader = torch.utils.data.DataLoader(
             train_data,
             batch_size=1,
@@ -579,9 +587,10 @@ if __name__ == "__main__":
         nbatches = args.num_batches if args.num_batches > 0 else len(train_loader)
 
     ### parse command line arguments ###
-    m_spa = args.arch_sparse_feature_size
-    num_fea = ln_emb.size + 1  # num sparse + num dense features
-    m_den_out = ln_bot[ln_bot.size - 1]
+    m_spa = args.arch_sparse_feature_size # 2
+    num_fea = ln_emb.size + 1  # num sparse + num dense features, category类特征的个数+1
+    #m_den_out = ln_bot[ln_bot.size - 1]
+    m_den_out = ln_bot[-1] # dense网络的最终输出
     if args.arch_interaction_op == "dot":
         # approach 1: all
         # num_int = num_fea * num_fea + m_den_out
@@ -589,8 +598,8 @@ if __name__ == "__main__":
         if args.arch_interaction_itself:
             num_int = (num_fea * (num_fea + 1)) // 2 + m_den_out
         else:
-            num_int = (num_fea * (num_fea - 1)) // 2 + m_den_out
-    elif args.arch_interaction_op == "cat":
+            num_int = (num_fea * (num_fea - 1)) // 2 + m_den_out  # 交互项的个数,category为两两交互,而dense与category不用交互, dense内部已经交互过
+    elif args.arch_interaction_op == "cat": # 不明白concat为啥是num_feat* m_den_out
         num_int = num_fea * m_den_out
     else:
         sys.exit(
@@ -598,8 +607,8 @@ if __name__ == "__main__":
             + args.arch_interaction_op
             + " is not supported"
         )
-    arch_mlp_top_adjusted = str(num_int) + "-" + args.arch_mlp_top
-    ln_top = np.fromstring(arch_mlp_top_adjusted, dtype=int, sep="-")
+    arch_mlp_top_adjusted = str(num_int) + "-" + args.arch_mlp_top  #  8-4-2-1
+    ln_top = np.fromstring(arch_mlp_top_adjusted, dtype=int, sep="-") # [8,4,2,1]
     # sanity check: feature sizes and mlp dimensions must match
     if m_den != ln_bot[0]:
         sys.exit(
@@ -656,24 +665,24 @@ if __name__ == "__main__":
         print(ln_emb)
 
         print("data (inputs and targets):")
-        for j, (X, lS_o, lS_i, T) in enumerate(train_loader):
+        for j, (dense_X, sparse_offset, sparse_index, Y) in enumerate(train_loader):
             # early exit if nbatches was set by the user and has been exceeded
             if j >= nbatches:
                 break
 
             print("mini-batch: %d" % j)
-            print(X.detach().cpu().numpy())
+            print(dense_X.detach().cpu().numpy())
             # transform offsets to lengths when printing
             print(
                 [
                     np.diff(
-                        S_o.detach().cpu().tolist() + list(lS_i[i].shape)
+                        S_o.detach().cpu().tolist() + list(sparse_index[i].shape)
                     ).tolist()
-                    for i, S_o in enumerate(lS_o)
+                    for i, S_o in enumerate(sparse_offset)
                 ]
             )
-            print([S_i.detach().cpu().tolist() for S_i in lS_i])
-            print(T.detach().cpu().numpy())
+            print([S_i.detach().cpu().tolist() for S_i in sparse_index])
+            print(Y.detach().cpu().numpy())
 
     ### construct the neural network specified above ###
     # WARNING: to obtain exactly the same initialization for
@@ -708,9 +717,9 @@ if __name__ == "__main__":
 
     # specify the loss function
     if args.loss_function == "mse":
-        loss_fn = torch.nn.MSELoss(reduction="mean")
+        loss_fn = torch.nn.MSELoss(reduction="mean") # mean square error
     elif args.loss_function == "bce":
-        loss_fn = torch.nn.BCELoss(reduction="mean")
+        loss_fn = torch.nn.BCELoss(reduction="mean") # Binary Cross Entropy
     else:
         sys.exit("ERROR: --loss-function=" + args.loss_function + " is not supported")
 
@@ -724,21 +733,21 @@ if __name__ == "__main__":
             torch.cuda.synchronize()
         return time.time()
 
-    def dlrm_wrap(X, lS_o, lS_i, use_gpu, device):
+    def dlrm_wrap(dense_x, sparse_offset, sparse_index, use_gpu, device):
         if use_gpu:  # .cuda()
             return dlrm(
-                X.to(device),
-                [S_o.to(device) for S_o in lS_o],
-                [S_i.to(device) for S_i in lS_i],
+                dense_x.to(device),
+                [S_o.to(device) for S_o in sparse_offset],
+                [S_i.to(device) for S_i in sparse_index],
             )
         else:
-            return dlrm(X, lS_o, lS_i)
+            return dlrm(dense_x, sparse_offset, sparse_index)
 
-    def loss_fn_wrap(Z, T, use_gpu, device):
+    def loss_fn_wrap(Z, Y, use_gpu, device):
         if use_gpu:
-            return loss_fn(Z, T.to(device))
+            return loss_fn(Z, Y.to(device))
         else:
-            return loss_fn(Z, T)
+            return loss_fn(Z, Y)
 
     # training or inference
     best_gA_test = 0
@@ -788,7 +797,8 @@ if __name__ == "__main__":
     print("time/loss/accuracy (if enabled):")
     with torch.autograd.profiler.profile(args.enable_profiling, use_gpu) as prof:
         while k < args.nepochs:
-            for j, (X, lS_o, lS_i, T) in enumerate(train_loader):
+            # X:[batch, 4], lS_o:3*list of 10 array, lS_i:3 list of [18,16,11], T:10*1
+            for j, (dense_X, sparse_offset, sparse_index, Y) in enumerate(train_loader):
                 # early exit if nbatches was set by the user and has been exceeded
                 if j >= nbatches:
                     break
@@ -798,15 +808,15 @@ if __name__ == "__main__":
                 print(X.detach().cpu().numpy())
                 print([np.diff(S_o.detach().cpu().tolist() + list(lS_i[i].shape)).tolist() for i, S_o in enumerate(lS_o)])
                 print([S_i.detach().cpu().numpy().tolist() for S_i in lS_i])
-                print(T.detach().cpu().numpy())
+                print(Y.detach().cpu().numpy())
                 '''
                 t1 = time_wrap(use_gpu)
 
-                # forward pass
-                Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, device)
+                # forward pass, 此处就是net forward
+                Y_pred = dlrm_wrap(dense_X, sparse_offset, sparse_index, use_gpu, device)
 
-                # loss
-                E = loss_fn_wrap(Z, T, use_gpu, device)
+                # loss forward
+                loss = loss_fn_wrap(Y_pred, Y, use_gpu, device)
                 '''
                 # debug prints
                 print("output and loss")
@@ -814,18 +824,18 @@ if __name__ == "__main__":
                 print(E.detach().cpu().numpy())
                 '''
                 # compute loss and accuracy
-                L = E.detach().cpu().numpy()  # numpy array
-                S = Z.detach().cpu().numpy()  # numpy array
-                T = T.detach().cpu().numpy()  # numpy array
-                mbs = T.shape[0]  # = args.mini_batch_size except maybe for last
-                A = np.sum((np.round(S, 0) == T).astype(np.uint8)) / mbs
+                L = loss.detach().cpu().numpy()  # numpy array
+                Y_pred_vector = Y_pred.detach().cpu().numpy()  # numpy array
+                Y = Y.detach().cpu().numpy()  # numpy array
+                mini_batch_size = Y.shape[0]  # = args.mini_batch_size except maybe for last
+                accurancy = np.sum((np.round(Y_pred_vector, 0) == Y).astype(np.uint8)) / mini_batch_size
 
                 if not args.inference_only:
                     # scaled error gradient propagation
                     # (where we do not accumulate gradients across mini-batches)
                     optimizer.zero_grad()
                     # backward pass
-                    E.backward()
+                    loss.backward()
                     # debug prints (check gradient norm)
                     # for l in mlp.layers:
                     #     if hasattr(l, 'weight'):
@@ -836,7 +846,7 @@ if __name__ == "__main__":
 
                 t2 = time_wrap(use_gpu)
                 total_time += t2 - t1
-                total_accu += A
+                total_accu += accurancy
                 total_loss += L
                 total_iter += 1
 
@@ -874,29 +884,29 @@ if __name__ == "__main__":
                     test_accu = 0
                     test_loss = 0
 
-                    for jt, (X_test, lS_o_test, lS_i_test, T_test) in enumerate(test_loader):
+                    for jt, (X_test, sparse_offset_test, sparse_index_test, Y_test) in enumerate(test_loader):
                         # early exit if nbatches was set by the user and has been exceeded
                         if jt >= nbatches:
                             break
 
                         t1_test = time_wrap(use_gpu)
 
-                        # forward pass
+                        # forward pass, 此处用()会调用forward方法
                         Z_test = dlrm_wrap(
-                            X_test, lS_o_test, lS_i_test, use_gpu, device
+                            X_test, sparse_offset_test, sparse_index_test, use_gpu, device
                         )
                         # loss
-                        E_test = loss_fn_wrap(Z_test, T_test, use_gpu, device)
+                        E_test = loss_fn_wrap(Z_test, Y_test, use_gpu, device)
 
                         # compute loss and accuracy
                         L_test = E_test.detach().cpu().numpy()  # numpy array
                         S_test = Z_test.detach().cpu().numpy()  # numpy array
-                        T_test = T_test.detach().cpu().numpy()  # numpy array
-                        mbs_test = T_test.shape[
+                        Y_test = Y_test.detach().cpu().numpy()  # numpy array
+                        mbs_test = Y_test.shape[
                             0
                         ]  # = args.mini_batch_size except maybe for last
                         A_test = (
-                            np.sum((np.round(S_test, 0) == T_test).astype(np.uint8))
+                            np.sum((np.round(S_test, 0) == Y_test).astype(np.uint8))
                             / mbs_test
                         )
 
@@ -968,9 +978,9 @@ if __name__ == "__main__":
     # export the model in onnx
     if args.save_onnx:
         with open("dlrm_s_pytorch.onnx", "w+b") as dlrm_pytorch_onnx_file:
-            (X, lS_o, lS_i, _) = train_data[0] # get first batch of elements
+            (dense_X, sparse_offset, sparse_index, _) = train_data[0] # get first batch of elements
             torch.onnx._export(
-                dlrm, (X, lS_o, lS_i), dlrm_pytorch_onnx_file, verbose=True
+                dlrm, (dense_X, sparse_offset, sparse_index), dlrm_pytorch_onnx_file, verbose=True
             )
         # recover the model back
         dlrm_pytorch_onnx = onnx.load("dlrm_s_pytorch.onnx")

@@ -86,7 +86,7 @@ exc = getattr(builtins, "IOError", "FileNotFoundError")
 
 ### define dlrm in PyTorch ###
 class DLRM_Net(nn.Module):
-    def create_mlp(self, layer_size_list, sigmoid_layer):
+    def create_mlp(self, layer_size_list, sigmoid_layer_index):
         # build MLP layer by layer
         layers = nn.ModuleList()
         for i in range(0, layer_size_list.size - 1):
@@ -94,7 +94,7 @@ class DLRM_Net(nn.Module):
             next_layer_size = layer_size_list[i + 1]
 
             # construct fully connected operator
-            LL = nn.Linear(in_features=int(cur_layer_size),
+            linear_layer = nn.Linear(in_features=int(cur_layer_size),
                            out_features=int(next_layer_size),
                            bias=True)
 
@@ -107,18 +107,18 @@ class DLRM_Net(nn.Module):
             std_dev = np.sqrt(1 / next_layer_size)  # np.sqrt(2 / (next_layer_size + 1))
             bt = np.random.normal(mean, std_dev, size=next_layer_size).astype(np.float32)
             # approach 1
-            LL.weight.data = torch.tensor(W, requires_grad=True)  # pytorch中layer的weight可以单独拿出来
-            LL.bias.data = torch.tensor(bt, requires_grad=True)
+            linear_layer.weight.data = torch.tensor(W, requires_grad=True)  # pytorch中layer的weight可以单独拿出来
+            linear_layer.bias.data = torch.tensor(bt, requires_grad=True)
             # approach 2
             # LL.weight.data.copy_(torch.tensor(W))
             # LL.bias.data.copy_(torch.tensor(bt))
             # approach 3
             # LL.weight = Parameter(torch.tensor(W),requires_grad=True)
             # LL.bias = Parameter(torch.tensor(bt),requires_grad=True)
-            layers.append(LL)
+            layers.append(linear_layer)
 
             # construct sigmoid or relu operator
-            if i == sigmoid_layer:
+            if i == sigmoid_layer_index:
                 layers.append(nn.Sigmoid())
             else:
                 layers.append(nn.ReLU())
@@ -215,19 +215,32 @@ class DLRM_Net(nn.Module):
             # The embeddings are represented as tall matrices, with sum
             # happening vertically across 0 axis, resulting in a row vector
             current_embed_layer = embedding_layers[k]
-            # 此处会调用EmbeddingBag.forward方法, vecotr:[batch, embedding_dim=2]
+            """
+            input:tensor([0, 1, 1, 3, 2, 3, 0, 2, 1, 2, 1, 2, 3, 2, 0, 1, 2, 2]),input中的元素为vocab_size中的index,个数不定
+            offsets:tensor([ 0,  2,  4,  6,  8, 10, 11, 13, 14, 17]), offsets的元素个数即为此次batch大小,即为10
+            embed_layer(input, offsets)表示:
+            input中的第[0,2)个元素来源于batch中的第0个样本,
+            input中的第[2,4)个元素来源于batch中的第1个样本,
+            input中的第[4,6)个元素来源于batch中的第2个样本,
+            ...
+            input中的第[17,18)个元素来源于batch中的第10个样本
+            """
+            # 此处会调用EmbeddingBag.forward方法, vector:[batch, embedding_dim=2]
             vector = current_embed_layer(input=sparse_index_group_batch, offsets=sparse_offset_group_batch)
 
             layers.append(vector)
 
         # print(ly)
         return layers
-    # dense_x:[batch, dim=2], category_embedding:3 list of [batch_dim]
+    # dense_x:[batch, dim=2], category_embedding:3 list of [batch,dim=2]
     def interact_features(self, dense_x, category_embedding):
-        if self.arch_interaction_op == "dot":
+        if self.arch_interaction_op == "dot": # dense与category特征两两交互
             # concatenate dense and sparse features
             (batch_size, dim) = dense_x.shape
-            T = torch.cat([dense_x] + category_embedding, dim=1).view((batch_size, -1, dim)) # T: [batch, feat_group_num=4, dim]
+            # T: [batch, feat_group_num=4, dim]
+            T = torch\
+                .cat([dense_x] + category_embedding, dim=1)\
+                .view((batch_size, -1, dim)) # T: [batch, feat_group_num=4, dim]
             # perform a dot product, 即两两特征进行交互
             Z_interact = torch.bmm(T, torch.transpose(T, 1, 2)) # transpose(T, 1, 2), Z: [batch, feat_group_num, feat_group_num]
             # append dense feature with the interactions (into a row vector)
@@ -266,12 +279,12 @@ class DLRM_Net(nn.Module):
 
     def sequential_forward(self, dense_x, sparse_offset, sparse_index):
         # process dense features (using bottom mlp), resulting in a row vector
-        dense_out = self.apply_mlp(dense_x, self.bottom_mlp_layers)
+        dense_out = self.apply_mlp(dense_x, self.bottom_mlp_layers) # dense_out:[batch, embed_dim]
         # debug prints
         # print("intermediate")
         # print(x.detach().cpu().numpy())
 
-        # process sparse features(using embeddings), resulting in a list of row vectors
+        # process sparse features(using embeddings), resulting in a list of row vectors, 3个[batch, embed_dim]
         category_embedding_out = self.apply_emb(sparse_offset, sparse_index, self.embedding_layers)
         # for y in ly:
         #     print(y.detach().cpu().numpy())
@@ -824,7 +837,7 @@ if __name__ == "__main__":
                 print(E.detach().cpu().numpy())
                 '''
                 # compute loss and accuracy
-                L = loss.detach().cpu().numpy()  # numpy array
+                L = loss.detach().cpu().numpy()  # numpy array, Returns a new Tensor, detached from the current graph.
                 Y_pred_vector = Y_pred.detach().cpu().numpy()  # numpy array
                 Y = Y.detach().cpu().numpy()  # numpy array
                 mini_batch_size = Y.shape[0]  # = args.mini_batch_size except maybe for last

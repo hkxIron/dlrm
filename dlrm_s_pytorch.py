@@ -155,8 +155,8 @@ class DLRM_Net(nn.Module):
     def __init__(
         self,
         embeding_dim=None, # 2
-        embedding_vocab_sizes=None, # ndarray([4,3,2])
-        bottom_layer_size_list=None, # ndarray([4,3,2])
+        category_embedding_vocab_sizes=None, # ndarray([4,3,2])
+        dense_bottom_layer_size_list=None, # ndarray([4,3,2])
         top_layer_size_list=None, # [8,4,2,1]
         arch_interaction_op=None, # dot
         arch_interaction_itself=False,
@@ -170,8 +170,8 @@ class DLRM_Net(nn.Module):
 
         if (
             (embeding_dim is not None)
-            and (embedding_vocab_sizes is not None)
-            and (bottom_layer_size_list is not None)
+            and (category_embedding_vocab_sizes is not None)
+            and (dense_bottom_layer_size_list is not None)
             and (top_layer_size_list is not None)
             and (arch_interaction_op is not None)
         ):
@@ -186,8 +186,8 @@ class DLRM_Net(nn.Module):
             self.sync_dense_params = sync_dense_params
             self.loss_threshold = loss_threshold
             # create operators
-            self.embedding_layers = self.create_emb(embeding_dim, embedding_vocab_sizes) # m_spa:2, ln_emb:[4,3,2],此处有3个embedding
-            self.bottom_mlp_layers = self.create_mlp(bottom_layer_size_list, sigmoid_bottom_index)
+            self.embedding_layers = self.create_emb(embeding_dim, category_embedding_vocab_sizes) # m_spa:2, ln_emb:[4,3,2],此处有3个embedding
+            self.bottom_mlp_layers = self.create_mlp(dense_bottom_layer_size_list, sigmoid_bottom_index)
             self.top_mlp_layers = self.create_mlp(top_layer_size_list, sigmoid_top_index)
 
     def apply_mlp(self, x, layers):
@@ -206,7 +206,7 @@ class DLRM_Net(nn.Module):
         # 2. for each embedding the lookups are further organized into a batch
         # 3. for a list of embedding tables there is a list of batched lookups
 
-        layers = [] # K:为embedding的group下标,即这个embedding来源于何处
+        group_embed_layers = [] # K:为embedding的group下标,即这个embedding来源于何处
         for k, sparse_index_group_batch in enumerate(sparse_index):
             sparse_offset_group_batch = sparse_offset[k]
 
@@ -216,38 +216,43 @@ class DLRM_Net(nn.Module):
             # happening vertically across 0 axis, resulting in a row vector
             current_embed_layer = embedding_layers[k]
             """
+            input=index
             input:tensor([0, 1, 1, 3, 2, 3, 0, 2, 1, 2, 1, 2, 3, 2, 0, 1, 2, 2]),input中的元素为vocab_size中的index,个数不定
             offsets:tensor([ 0,  2,  4,  6,  8, 10, 11, 13, 14, 17]), offsets的元素个数即为此次batch大小,即为10
+            
             embed_layer(input, offsets)表示:
-            input中的第[0,2)个元素来源于batch中的第0个样本,
-            input中的第[2,4)个元素来源于batch中的第1个样本,
-            input中的第[4,6)个元素来源于batch中的第2个样本,
+            offset中[0,2]表示input中的第[0,2)个元素来源于batch中的第0个样本,
+            offset中[2,4]表示input中的第[2,4)个元素来源于batch中的第1个样本,
+            offset中[4,6]表示input中的第[4,6)个元素来源于batch中的第2个样本,
             ...
-            input中的第[17,18)个元素来源于batch中的第10个样本
+            offset中[17,18]表示input中的第[17,18)个元素来源于batch中的第10个样本
             """
             # 此处会调用EmbeddingBag.forward方法, vector:[batch, embedding_dim=2]
             vector = current_embed_layer(input=sparse_index_group_batch, offsets=sparse_offset_group_batch)
 
-            layers.append(vector)
+            group_embed_layers.append(vector)
 
         # print(ly)
-        return layers
+        return group_embed_layers
     # dense_x:[batch, dim=2], category_embedding:3 list of [batch,dim=2]
-    def interact_features(self, dense_x, category_embedding):
+    def interact_features(self, dense_out, group_category_embedding_list):
         if self.arch_interaction_op == "dot": # dense与category特征两两交互
             # concatenate dense and sparse features
-            (batch_size, dim) = dense_x.shape
-            # T: [batch, feat_group_num=4, dim]
-            T = torch\
-                .cat([dense_x] + category_embedding, dim=1)\
-                .view((batch_size, -1, dim)) # T: [batch, feat_group_num=4, dim]
-            # perform a dot product, 即两两特征进行交互
-            Z_interact = torch.bmm(T, torch.transpose(T, 1, 2)) # transpose(T, 1, 2), Z: [batch, feat_group_num, feat_group_num]
+            (batch_size, dim) = dense_out.shape
+            # 此处将dense_out看成同一组embedding, 与category embedding组成新的特征组,进行两两交互
+            # group_cate_dense_embed: [batch, feat_group_num=4, dim]
+            group_cate_dense_embed = torch\
+                .cat([dense_out] + group_category_embedding_list, dim=1) \
+                .view((batch_size, -1, dim)) # group_cate_dense_embed: [batch, feat_group_num=4, dim]
+            # perform a dot product, 即两两特征组之间进行点乘dot交互
+            # transpose(group_cate_dense_embed, 1, 2),
+            # Z_interact: [batch, feat_group_num, feat_group_num]
+            Z_interact = torch.bmm(group_cate_dense_embed, torch.transpose(group_cate_dense_embed, 1, 2))
             # append dense feature with the interactions (into a row vector)
             # approach 1: all
             # Zflat = Z.view((batch_size, -1))
             # approach 2: unique
-            _, ni, nj = Z_interact.shape
+            _, ni, nj = Z_interact.shape # ni,nj: feat_group_num
             # approach 1: tril_indices
             # offset = 0 if self.arch_interaction_itself else -1
             # li, lj = torch.tril_indices(ni, nj, offset=offset) # 这种方法更好理解一些
@@ -256,12 +261,22 @@ class DLRM_Net(nn.Module):
             offset = 1 if self.arch_interaction_itself else 0
             li = torch.tensor([i for i in range(ni) for j in range(i + offset)]) # li:[1,2,2,3,3,3]
             lj = torch.tensor([j for i in range(nj) for j in range(i + offset)]) # lj:[0,0,1,0,1,2]
-            Zflat = Z_interact[:, li, lj] # Z_interact:[batch, feat_group_num, feat_group_num], Z_flat:[batch, comb(feat_group_num=4,2)=6]
+            """
+            li,lj组成的index如下:
+            [[x,_,_],
+             [x,x,_], 
+             [x,x,x], 
+            ]
+            """
+            # Z_interact:[batch, feat_group_num, feat_group_num],
+            # Z_flat:[batch, comb(feat_group_num=4,2)=6], comb(feat_group_num, 2),为两两组合数,代表第li个特征与第lj个特征之间的组合
+            Zflat = Z_interact[:, li, lj]
+            # 将最后的交互特征与原始dense特征进行拼接后返回
             # concatenate dense features and interactions
-            R = torch.cat([dense_x] + [Zflat], dim=1) # [batch, comb(feat_group_num,2)+dense_dim]
+            R = torch.cat([dense_out] + [Zflat], dim=1) # [batch, comb(feat_group_num,2)+dense_dim]
         elif self.arch_interaction_op == "cat":
             # concatenation features (into a row vector)
-            R = torch.cat([dense_x] + category_embedding, dim=1)
+            R = torch.cat([dense_out] + group_category_embedding_list, dim=1)
         else:
             sys.exit(
                 "ERROR: --arch-interaction-op="
@@ -278,31 +293,34 @@ class DLRM_Net(nn.Module):
             return self.parallel_forward(dense_x, sparse_offset, sparse_index)
 
     def sequential_forward(self, dense_x, sparse_offset, sparse_index):
+        # 1. dense feature,即连续特征
         # process dense features (using bottom mlp), resulting in a row vector
         dense_out = self.apply_mlp(dense_x, self.bottom_mlp_layers) # dense_out:[batch, embed_dim]
         # debug prints
         # print("intermediate")
         # print(x.detach().cpu().numpy())
 
-        # process sparse features(using embeddings), resulting in a list of row vectors, 3个[batch, embed_dim]
-        category_embedding_out = self.apply_emb(sparse_offset, sparse_index, self.embedding_layers)
+        # 2.离散特征, 生成多个group的batch embedding
+        # process sparse features(using embeddings), resulting in a list of row vectors,如: 3个[batch, embed_dim], 3个categroy feature group的个数
+        category_embedding_out_list = self.apply_emb(sparse_offset, sparse_index, self.embedding_layers)
         # for y in ly:
         #     print(y.detach().cpu().numpy())
 
-        # interact features (dense and sparse), z:[batch, 8]
-        z = self.interact_features(dense_out, category_embedding_out)
-        # print(z.detach().cpu().numpy())
+        # 3. 离散特征之间的交互
+        # interact features (dense and sparse), interact:[batch, 8]
+        interact = self.interact_features(dense_out, category_embedding_out_list)
+        # print(interact.detach().cpu().numpy())
 
         # obtain probability of a click (using top mlp), 在交互项之后的layer
-        p = self.apply_mlp(z, self.top_mlp_layers) # layer:8->4->2->1
+        p = self.apply_mlp(interact, self.top_mlp_layers) # layer:8->4->2->1
 
         # clamp output if needed
         if 0.0 < self.loss_threshold and self.loss_threshold < 1.0:
-            z = torch.clamp(p, min=self.loss_threshold, max=(1.0 - self.loss_threshold))
+            prob = torch.clamp(p, min=self.loss_threshold, max=(1.0 - self.loss_threshold))
         else:
-            z = p
+            prob = p
 
-        return z
+        return prob
 
     def parallel_forward(self, dense_x, lS_o, lS_i):
         ### prepare model (overwrite) ###
@@ -494,8 +512,8 @@ if __name__ == "__main__":
         print("Using CPU...")
 
     ### prepare training data ###
-    bottom_layer_size_list = np.fromstring(args.arch_mlp_bot, dtype=int, sep="-") # ln_bot:array([4,3,2]), 代表mlp网络:4 ->3 ->2
-    print("ln_bot:{}".format(bottom_layer_size_list))
+    bottom_dense_layer_size_list = np.fromstring(args.arch_mlp_bot, dtype=int, sep="-") # ln_bot:array([4,3,2]), 代表mlp网络:4 ->3 ->2
+    print("ln_bot:{}".format(bottom_dense_layer_size_list))
     # input data
     if args.data_generation == "dataset":
         # input and target from dataset
@@ -553,9 +571,9 @@ if __name__ == "__main__":
         )
         nbatches_test = len(test_loader)
 
-        embed_vocab_size_list = train_data.counts
+        category_embed_vocab_size_list = train_data.counts
         m_den = train_data.m_den
-        bottom_layer_size_list[0] = m_den
+        bottom_dense_layer_size_list[0] = m_den
     else:
         # input and target at random
         def collate_wrapper(list_of_tuples):
@@ -569,11 +587,11 @@ if __name__ == "__main__":
             else:
                 return list_of_tuples[0]
 
-        embed_vocab_size_list = np.fromstring(args.arch_embedding_size, dtype=int, sep="-") # ln_emb:array([4,3,2])
-        m_den = bottom_layer_size_list[0] # bot => bottom, m_den:4
+        category_embed_vocab_size_list = np.fromstring(args.arch_embedding_size, dtype=int, sep="-") # ln_emb:array([4,3,2])
+        m_den = bottom_dense_layer_size_list[0] # bot => bottom, m_den:4
         train_data = dp.RandomDataset(
             m_den, # 4
-            embed_vocab_size_list, # [4,3,2]
+            category_embed_vocab_size_list, # [4,3,2]
             args.data_size, # 100
             args.num_batches, # 0
             args.mini_batch_size, # 10
@@ -601,46 +619,49 @@ if __name__ == "__main__":
 
     ### parse command line arguments ###
     embed_dim = args.arch_sparse_feature_size # 2
-    num_fea = embed_vocab_size_list.size + 1  # num sparse + num dense features, category类特征的个数+1
+    # category类特征的个数+1, 但不明白为何要加1
+    category_feat_num = category_embed_vocab_size_list.size + 1  # category类特征的个数+1
     #m_den_out = ln_bot[ln_bot.size - 1]
-    m_den_out = bottom_layer_size_list[-1] # dense网络的最终输出
+    last_dense_out_dim = bottom_dense_layer_size_list[-1] # dense网络的最终输出维度
     if args.arch_interaction_op == "dot":
         # approach 1: all
         # num_int = num_fea * num_fea + m_den_out
         # approach 2: unique
-        if args.arch_interaction_itself:
-            num_int = (num_fea * (num_fea + 1)) // 2 + m_den_out
+        if args.arch_interaction_itself: # 是否需要与自己交互
+            interact_dim = (category_feat_num * (category_feat_num + 1)) // 2 + last_dense_out_dim
         else:
-            num_int = (num_fea * (num_fea - 1)) // 2 + m_den_out  # 交互项的个数,category为两两交互,而dense与category不用交互, dense内部已经交互过
+            # 交互项的个数,category为两两交互,而dense与category不用交互, dense与dense也不用交互, dense内部已经交互过
+            interact_dim = (category_feat_num * (category_feat_num - 1)) // 2 + last_dense_out_dim
     elif args.arch_interaction_op == "cat": # 不明白concat为啥是num_feat* m_den_out
-        num_int = num_fea * m_den_out
+        interact_dim = category_feat_num * last_dense_out_dim
     else:
         sys.exit(
             "ERROR: --arch-interaction-op="
             + args.arch_interaction_op
             + " is not supported"
         )
-    arch_mlp_top_adjusted = str(num_int) + "-" + args.arch_mlp_top  #  8-4-2-1
-    top_layer_size_list = np.fromstring(arch_mlp_top_adjusted, dtype=int, sep="-") # [8,4,2,1]
+    # 将interact放在全连接的第一位
+    arch_mlp_top_with_interact = str(interact_dim) + "-" + args.arch_mlp_top  #  8-4-2-1
+    top_layer_size_list = np.fromstring(arch_mlp_top_with_interact, dtype=int, sep="-") # [8,4,2,1]
     # sanity check: feature sizes and mlp dimensions must match
-    if m_den != bottom_layer_size_list[0]:
+    if m_den != bottom_dense_layer_size_list[0]:
         sys.exit(
             "ERROR: arch-dense-feature-size "
             + str(m_den)
             + " does not match first dim of bottom mlp "
-            + str(bottom_layer_size_list[0])
+            + str(bottom_dense_layer_size_list[0])
         )
-    if embed_dim != m_den_out:
+    if embed_dim != last_dense_out_dim:
         sys.exit(
             "ERROR: arch-sparse-feature-size "
             + str(embed_dim)
             + " does not match last dim of bottom mlp "
-            + str(m_den_out)
+            + str(last_dense_out_dim)
         )
-    if num_int != top_layer_size_list[0]:
+    if interact_dim != top_layer_size_list[0]:
         sys.exit(
             "ERROR: # of feature interactions "
-            + str(num_int)
+            + str(interact_dim)
             + " does not match first dimension of top mlp "
             + str(top_layer_size_list[0])
         )
@@ -655,27 +676,27 @@ if __name__ == "__main__":
         )
         print(top_layer_size_list)
         print("# of interactions")
-        print(num_int)
+        print(interact_dim)
         print(
             "mlp bot arch "
-            + str(bottom_layer_size_list.size - 1)
+            + str(bottom_dense_layer_size_list.size - 1)
             + " layers, with input to output dimensions:"
         )
-        print(bottom_layer_size_list)
+        print(bottom_dense_layer_size_list)
         print("# of features (sparse and dense)")
-        print(num_fea)
+        print(category_feat_num)
         print("dense feature size")
         print(m_den)
         print("sparse feature size")
         print(embed_dim)
         print(
             "# of embeddings (= # of sparse features) "
-            + str(embed_vocab_size_list.size)
+            + str(category_embed_vocab_size_list.size)
             + ", with dimensions "
             + str(embed_dim)
             + "x:"
         )
-        print(embed_vocab_size_list)
+        print(category_embed_vocab_size_list)
 
         print("data (inputs and targets):")
         for j, (dense_X, sparse_offset, sparse_index, Y) in enumerate(train_loader):
@@ -703,9 +724,9 @@ if __name__ == "__main__":
     # np.random.seed(args.numpy_rand_seed)
     dlrm = DLRM_Net(
         embed_dim,
-        embed_vocab_size_list,
-        bottom_layer_size_list,
-        top_layer_size_list,
+        category_embed_vocab_size_list, # 类别类特征的embed list
+        bottom_dense_layer_size_list, # 连续类特征的 各层网络节点个数
+        top_layer_size_list, # [8,4,2,1]
         arch_interaction_op=args.arch_interaction_op,
         arch_interaction_itself=args.arch_interaction_itself,
         sigmoid_bottom_index=-1,
@@ -725,7 +746,7 @@ if __name__ == "__main__":
             # Custom Model-Data Parallel
             # the mlps are replicated and use data parallelism, while
             # the embeddings are distributed and use model parallelism
-            dlrm.ndevices = min(ngpus, args.mini_batch_size, num_fea - 1)
+            dlrm.ndevices = min(ngpus, args.mini_batch_size, category_feat_num - 1)
         dlrm = dlrm.to(device)  # .cuda()
 
     # specify the loss function
@@ -825,6 +846,7 @@ if __name__ == "__main__":
                 '''
                 t1 = time_wrap(use_gpu)
 
+                # TODO:sparse_offset, sparse_index参见函数 apply_emb
                 # forward pass, 此处就是net forward
                 Y_pred = dlrm_wrap(dense_X, sparse_offset, sparse_index, use_gpu, device)
 
